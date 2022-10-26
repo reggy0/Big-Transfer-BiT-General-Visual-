@@ -13,275 +13,141 @@
 # limitations under the License.
 
 # Lint as: python3
-"""Fine-tune a BiT model on some downstream dataset."""
-#!/usr/bin/env python3
 # coding: utf-8
-from os.path import join as pjoin  # pylint: disable=g-importing-member
+
+from functools import partial
 import time
+import os
 
-import numpy as np
-import torch
-import torchvision as tv
-
-import bit_pytorch.fewshot as fs
-import bit_pytorch.lbtoolbox as lb
-import bit_pytorch.models as models
+import tensorflow.compat.v2 as tf
+tf.enable_v2_behavior()
 
 import bit_common
 import bit_hyperrule
+import bit_tf2.models as models
+import input_pipeline_tf2_or_jax as input_pipeline
 
 
-def topk(output, target, ks=(1,)):
-  """Returns one boolean vector for each k, whether the target is within the output's top-k."""
-  _, pred = output.topk(max(ks), 1, True, True)
-  pred = pred.t()
-  correct = pred.eq(target.view(1, -1).expand_as(pred))
-  return [correct[:k].max(0)[0] for k in ks]
+def reshape_for_keras(features, batch_size, crop_size):
+  features["image"] = tf.reshape(features["image"], (batch_size, crop_size, crop_size, 3))
+  features["label"] = tf.reshape(features["label"], (batch_size, -1))
+  return (features["image"], features["label"])
 
 
-def recycle(iterable):
-  """Variant of itertools.cycle that does not save iterates."""
-  while True:
-    for i in iterable:
-      yield i
+class BiTLRSched(tf.keras.callbacks.Callback):
+  def __init__(self, base_lr, num_samples):
+    self.step = 0
+    self.base_lr = base_lr
+    self.num_samples = num_samples
 
+  def on_train_batch_begin(self, batch, logs=None):
+    lr = bit_hyperrule.get_lr(self.step, self.num_samples, self.base_lr)
+    tf.keras.backend.set_value(self.model.optimizer.lr, lr)
+    self.step += 1
 
-def mktrainval(args, logger):
-  """Returns train and validation datasets."""
-  precrop, crop = bit_hyperrule.get_resolution_from_dataset(args.dataset)
-  train_tx = tv.transforms.Compose([
-      tv.transforms.Resize((precrop, precrop)),
-      tv.transforms.RandomCrop((crop, crop)),
-      tv.transforms.RandomHorizontalFlip(),
-      tv.transforms.ToTensor(),
-      tv.transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-  ])
-  val_tx = tv.transforms.Compose([
-      tv.transforms.Resize((crop, crop)),
-      tv.transforms.ToTensor(),
-      tv.transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-  ])
-
-  if args.dataset == "cifar10":
-    train_set = tv.datasets.CIFAR10(args.datadir, transform=train_tx, train=True, download=True)
-    valid_set = tv.datasets.CIFAR10(args.datadir, transform=val_tx, train=False, download=True)
-  elif args.dataset == "cifar100":
-    train_set = tv.datasets.CIFAR100(args.datadir, transform=train_tx, train=True, download=True)
-    valid_set = tv.datasets.CIFAR100(args.datadir, transform=val_tx, train=False, download=True)
-  elif args.dataset == "imagenet2012":
-    train_set = tv.datasets.ImageFolder(pjoin(args.datadir, "train"), train_tx)
-    valid_set = tv.datasets.ImageFolder(pjoin(args.datadir, "val"), val_tx)
-  else:
-    raise ValueError(f"Sorry, we have not spent time implementing the "
-                     f"{args.dataset} dataset in the PyTorch codebase. "
-                     f"In principle, it should be easy to add :)")
-
-  if args.examples_per_class is not None:
-    logger.info(f"Looking for {args.examples_per_class} images per class...")
-    indices = fs.find_fewshot_indices(train_set, args.examples_per_class)
-    train_set = torch.utils.data.Subset(train_set, indices=indices)
-
-  logger.info(f"Using a training set with {len(train_set)} images.")
-  logger.info(f"Using a validation set with {len(valid_set)} images.")
-
-  micro_batch_size = args.batch // args.batch_split
-
-  valid_loader = torch.utils.data.DataLoader(
-      valid_set, batch_size=micro_batch_size, shuffle=False,
-      num_workers=args.workers, pin_memory=True, drop_last=False)
-
-  if micro_batch_size <= len(train_set):
-    train_loader = torch.utils.data.DataLoader(
-        train_set, batch_size=micro_batch_size, shuffle=True,
-        num_workers=args.workers, pin_memory=True, drop_last=False)
-  else:
-    # In the few-shot cases, the total dataset size might be smaller than the batch-size.
-    # In these cases, the default sampler doesn't repeat, so we need to make it do that
-    # if we want to match the behaviour from the paper.
-    train_loader = torch.utils.data.DataLoader(
-        train_set, batch_size=micro_batch_size, num_workers=args.workers, pin_memory=True,
-        sampler=torch.utils.data.RandomSampler(train_set, replacement=True, num_samples=micro_batch_size))
-
-  return train_set, valid_set, train_loader, valid_loader
-
-
-def run_eval(model, data_loader, device, chrono, logger, step):
-  # switch to evaluate mode
-  model.eval()
-
-  logger.info("Running validation...")
-  logger.flush()
-
-  all_c, all_top1, all_top5 = [], [], []
-  end = time.time()
-  for b, (x, y) in enumerate(data_loader):
-    with torch.no_grad():
-      x = x.to(device, non_blocking=True)
-      y = y.to(device, non_blocking=True)
-
-      # measure data loading time
-      chrono._done("eval load", time.time() - end)
-
-      # compute output, measure accuracy and record loss.
-      with chrono.measure("eval fprop"):
-        logits = model(x)
-        c = torch.nn.CrossEntropyLoss(reduction='none')(logits, y)
-        top1, top5 = topk(logits, y, ks=(1, 5))
-        all_c.extend(c.cpu())  # Also ensures a sync point.
-        all_top1.extend(top1.cpu())
-        all_top5.extend(top5.cpu())
-
-    # measure elapsed time
-    end = time.time()
-
-  model.train()
-  logger.info(f"Validation@{step} loss {np.mean(all_c):.5f}, "
-              f"top1 {np.mean(all_top1):.2%}, "
-              f"top5 {np.mean(all_top5):.2%}")
-  logger.flush()
-  return all_c, all_top1, all_top5
-
-
-def mixup_data(x, y, l):
-  """Returns mixed inputs, pairs of targets, and lambda"""
-  indices = torch.randperm(x.shape[0]).to(x.device)
-
-  mixed_x = l * x + (1 - l) * x[indices]
-  y_a, y_b = y, y[indices]
-  return mixed_x, y_a, y_b
-
-
-def mixup_criterion(criterion, pred, y_a, y_b, l):
-  return l * criterion(pred, y_a) + (1 - l) * criterion(pred, y_b)
 
 
 def main(args):
+  tf.io.gfile.makedirs(args.logdir)
   logger = bit_common.setup_logger(args)
 
-  # Lets cuDNN benchmark conv implementations and choose the fastest.
-  # Only good if sizes stay the same within the main loop!
-  torch.backends.cudnn.benchmark = True
+  logger.info(f'Available devices: {tf.config.list_physical_devices()}')
 
-  device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-  logger.info(f"Going to train on {device}")
+  tf.io.gfile.makedirs(args.bit_pretrained_dir)
+  bit_model_file = os.path.join(args.bit_pretrained_dir, f'{args.model}.h5')
+  if not tf.io.gfile.exists(bit_model_file):
+    model_url = models.KNOWN_MODELS[args.model]
+    logger.info(f'Downloading the model from {model_url}...')
+    tf.io.gfile.copy(model_url, bit_model_file)
 
-  train_set, valid_set, train_loader, valid_loader = mktrainval(args, logger)
+  # Set up input pipeline
+  dataset_info = input_pipeline.get_dataset_info(
+    args.dataset, 'train', args.examples_per_class)
 
-  logger.info(f"Loading model from {args.model}.npz")
-  model = models.KNOWN_MODELS[args.model](head_size=len(valid_set.classes), zero_head=True)
-  model.load_from(np.load(f"{args.model}.npz"))
+  # Distribute training
+  strategy = tf.distribute.MirroredStrategy()
+  num_devices = strategy.num_replicas_in_sync
+  print('Number of devices: {}'.format(num_devices))
 
-  logger.info("Moving model onto all GPUs")
-  model = torch.nn.DataParallel(model)
+  resize_size, crop_size = bit_hyperrule.get_resolution_from_dataset(args.dataset)
+  data_train = input_pipeline.get_data(
+    dataset=args.dataset, mode='train',
+    repeats=None, batch_size=args.batch,
+    resize_size=resize_size, crop_size=crop_size,
+    examples_per_class=args.examples_per_class,
+    examples_per_class_seed=args.examples_per_class_seed,
+    mixup_alpha=bit_hyperrule.get_mixup(dataset_info['num_examples']),
+    num_devices=num_devices,
+    tfds_manual_dir=args.tfds_manual_dir)
+  data_test = input_pipeline.get_data(
+    dataset=args.dataset, mode='test',
+    repeats=1, batch_size=args.batch,
+    resize_size=resize_size, crop_size=crop_size,
+    examples_per_class=1, examples_per_class_seed=0,
+    mixup_alpha=None,
+    num_devices=num_devices,
+    tfds_manual_dir=args.tfds_manual_dir)
 
-  # Optionally resume from a checkpoint.
-  # Load it to CPU first as we'll move the model to GPU later.
-  # This way, we save a little bit of GPU memory when loading.
-  step = 0
+  data_train = data_train.map(lambda x: reshape_for_keras(
+    x, batch_size=args.batch, crop_size=crop_size))
+  data_test = data_test.map(lambda x: reshape_for_keras(
+    x, batch_size=args.batch, crop_size=crop_size))
 
-  # Note: no weight-decay!
-  optim = torch.optim.SGD(model.parameters(), lr=0.003, momentum=0.9)
+  with strategy.scope():
+    filters_factor = int(args.model[-1])*4
+    model = models.ResnetV2(
+        num_units=models.NUM_UNITS[args.model],
+        num_outputs=21843,
+        filters_factor=filters_factor,
+        name="resnet",
+        trainable=True,
+        dtype=tf.float32)
 
-  # Resume fine-tuning if we find a saved model.
-  savename = pjoin(args.logdir, args.name, "bit.pth.tar")
-  try:
-    logger.info(f"Model will be saved in '{savename}'")
-    checkpoint = torch.load(savename, map_location="cpu")
-    logger.info(f"Found saved model to resume from at '{savename}'")
+    model.build((None, None, None, 3))
+    logger.info(f'Loading weights...')
+    model.load_weights(bit_model_file)
+    logger.info(f'Weights loaded into model!')
 
-    step = checkpoint["step"]
-    model.load_state_dict(checkpoint["model"])
-    optim.load_state_dict(checkpoint["optim"])
-    logger.info(f"Resumed at step {step}")
-  except FileNotFoundError:
-    logger.info("Fine-tuning from BiT")
+    model._head = tf.keras.layers.Dense(
+        units=dataset_info['num_classes'],
+        use_bias=True,
+        kernel_initializer="zeros",
+        trainable=True,
+        name="head/dense")
 
-  model = model.to(device)
-  optim.zero_grad()
+    lr_supports = bit_hyperrule.get_schedule(dataset_info['num_examples'])
 
-  model.train()
-  mixup = bit_hyperrule.get_mixup(len(train_set))
-  cri = torch.nn.CrossEntropyLoss().to(device)
+    schedule_length = lr_supports[-1]
+    # NOTE: Let's not do that unless verified necessary and we do the same
+    # across all three codebases.
+    # schedule_length = schedule_length * 512 / args.batch
 
-  logger.info("Starting training!")
-  chrono = lb.Chrono()
-  accum_steps = 0
-  mixup_l = np.random.beta(mixup, mixup) if mixup > 0 else 1
-  end = time.time()
+    optimizer = tf.keras.optimizers.SGD(momentum=0.9)
+    loss_fn = tf.keras.losses.CategoricalCrossentropy(from_logits=True)
 
-  with lb.Uninterrupt() as u:
-    for x, y in recycle(train_loader):
-      # measure data loading time, which is spent in the `for` statement.
-      chrono._done("load", time.time() - end)
+    model.compile(optimizer=optimizer, loss=loss_fn, metrics=['accuracy'])
 
-      if u.interrupted:
-        break
+  logger.info(f'Fine-tuning the model...')
+  steps_per_epoch = args.eval_every or schedule_length
+  history = model.fit(
+      data_train,
+      steps_per_epoch=steps_per_epoch,
+      epochs=schedule_length // steps_per_epoch,
+      validation_data=data_test,  # here we are only using
+                                  # this data to evaluate our performance
+      callbacks=[BiTLRSched(args.base_lr, dataset_info['num_examples'])],
+  )
 
-      # Schedule sending to GPU(s)
-      x = x.to(device, non_blocking=True)
-      y = y.to(device, non_blocking=True)
-
-      # Update learning-rate, including stop training if over.
-      lr = bit_hyperrule.get_lr(step, len(train_set), args.base_lr)
-      if lr is None:
-        break
-      for param_group in optim.param_groups:
-        param_group["lr"] = lr
-
-      if mixup > 0.0:
-        x, y_a, y_b = mixup_data(x, y, mixup_l)
-
-      # compute output
-      with chrono.measure("fprop"):
-        logits = model(x)
-        if mixup > 0.0:
-          c = mixup_criterion(cri, logits, y_a, y_b, mixup_l)
-        else:
-          c = cri(logits, y)
-        c_num = float(c.data.cpu().numpy())  # Also ensures a sync point.
-
-      # Accumulate grads
-      with chrono.measure("grads"):
-        (c / args.batch_split).backward()
-        accum_steps += 1
-
-      accstep = f" ({accum_steps}/{args.batch_split})" if args.batch_split > 1 else ""
-      logger.info(f"[step {step}{accstep}]: loss={c_num:.5f} (lr={lr:.1e})")  # pylint: disable=logging-format-interpolation
-      logger.flush()
-
-      # Update params
-      if accum_steps == args.batch_split:
-        with chrono.measure("update"):
-          optim.step()
-          optim.zero_grad()
-        step += 1
-        accum_steps = 0
-        # Sample new mixup ratio for next batch
-        mixup_l = np.random.beta(mixup, mixup) if mixup > 0 else 1
-
-        # Run evaluation and save the model.
-        if args.eval_every and step % args.eval_every == 0:
-          run_eval(model, valid_loader, device, chrono, logger, step)
-          if args.save:
-            torch.save({
-                "step": step,
-                "model": model.state_dict(),
-                "optim" : optim.state_dict(),
-            }, savename)
-
-      end = time.time()
-
-    # Final eval at end of training.
-    run_eval(model, valid_loader, device, chrono, logger, step='end')
-
-  logger.info(f"Timings:\n{chrono}")
+  for epoch, accu in enumerate(history.history['val_accuracy']):
+    logger.info(
+            f'Step: {epoch * args.eval_every}, '
+            f'Test accuracy: {accu:0.3f}')
 
 
 if __name__ == "__main__":
   parser = bit_common.argparser(models.KNOWN_MODELS.keys())
-  parser.add_argument("--datadir", required=True,
-                      help="Path to the ImageNet data folder, preprocessed for torchvision.")
-  parser.add_argument("--workers", type=int, default=8,
-                      help="Number of background threads used to load data.")
-  parser.add_argument("--no-save", dest="save", action="store_false")
+  parser.add_argument("--tfds_manual_dir", default=None,
+                      help="Path to maually downloaded dataset.")
+  parser.add_argument("--batch_eval", default=32, type=int,
+                      help="Eval batch size.")
   main(parser.parse_args())
